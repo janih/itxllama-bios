@@ -28,6 +28,7 @@
 #include "arch/io.h"
 #include "chip.h"
 #include "southbridge.h"
+#include <device/pci_def.h>
 
 /* IRQ number to S/B PCI Interrupt routing table reg(0x58/0xb4) mapping table. */
 static const unsigned char irq_to_int_routing[16] = {
@@ -36,6 +37,19 @@ static const unsigned char irq_to_int_routing[16] = {
 	0x0, 0x1, 0x3, 0x9,	// IRQ8 is unmappable, IRQ9-11 = 1, 3, 9.
 	0xb, 0x0, 0xd, 0xf	// IRQ12 = b, IRQ13 is unmappable, IRQ14-15 = d, f.
 };
+
+
+#ifndef PCI_CAP_ID_PM
+#define PCI_CAP_ID_PM   0x01
+#endif
+#ifndef PCI_CAP_ID_AGP
+#define PCI_CAP_ID_AGP  0x02
+#endif
+
+
+#define DISABLE_S3_AGP_FEATURES 1
+#define FIXUP_PCI_IRQ_LINES 1
+#define DISABLE_VGA_PALETTE_SNOOPING 1
 
 /* S/B PCI Interrupt routing table reg(0x58) field bit shift. */
 #define EHCIH_IRQ_SHIFT 28
@@ -65,8 +79,8 @@ static const unsigned char irq_to_int_routing[16] = {
 #define MAC_IRQ 9
 
 #define CAN_IRQ 5
-#define HDA_IRQ 7
-#define USBD_IRQ 5
+#define HDA_IRQ 11
+#define USBD_IRQ 11
 #define PIDE_IRQ 11
 
 #define SPI1_IRQ 3
@@ -75,10 +89,11 @@ static const unsigned char irq_to_int_routing[16] = {
 #define PCIET_IRQ 4
 
 /* RT0-3 IRQs. */
-#define RT3_IRQ 15
-#define RT2_IRQ 15
-#define RT1_IRQ 15
-#define RT0_IRQ 15
+#define RT3_IRQ 5
+#define RT2_IRQ 5
+#define RT1_IRQ 5
+/*VGA cards sits on root bridge 00:01.0 -> RT0 (INTA). Map to a real (and prefferably free) 8259 IRQ. */
+#define RT0_IRQ 5
 
 /* IDE legacy mode IRQs. */
 #define IDE1_LEGACY_IRQ 14
@@ -109,6 +124,293 @@ static void verify_dmp_keyboard_error(void)
 {
 	post_code(POST_KBD_FW_VERIFY_FAILURE);
 	die("Internal keyboard firmware verify error!\n");
+}
+
+
+/* Return offset of a capability, or 0 if not present */
+static u8 find_capability(struct device *d, u8 cap_id)
+{
+    u16 status;
+    u8 pos;
+    u8 id;
+    u8 nxt;
+    int i;
+
+    status = pci_read_config16(d, PCI_STATUS);
+    if (!(status & 0x0010))
+        return 0;
+
+    pos = pci_read_config8(d, PCI_CAPABILITY_LIST); /* 0x34 */
+    for (i = 0; i < 48 && pos >= 0x40; i++)
+    {
+        id  = pci_read_config8(d, pos + 0x0);
+        nxt = pci_read_config8(d, pos + 0x1);
+        if (id == cap_id)
+            return pos;
+        if (nxt == 0 || nxt == pos)
+            break;
+        pos = nxt;
+    }
+    return 0;
+}
+
+/* Zero the AGP Command dword to discourage the driver from enabling AGP */
+static void disable_agp_command(struct device *d)
+{
+    u8 agp;
+    agp = find_capability(d, PCI_CAP_ID_AGP);
+    if (!agp)
+        return;
+
+    /* cap + 0x04 = AGP Status (RO), cap + 0x08 = AGP Command (RW) */
+    (void)pci_read_config32(d, agp + 0x04);
+    pci_write_config32(d, agp + 0x08, 0x00000000);
+}
+
+
+/* Find S3 VGA on the secondary bus and try to disable AGP features */
+static void kill_agp_on_bus2_if_s3(void)
+{
+ if (DISABLE_S3_AGP_FEATURES)
+ {
+    const u8 bus = 0x02;
+    int devn;
+    struct device *d;
+    u32 classrev;
+    u8 classcode;
+    u16 vendor;
+
+    for (devn = 0; devn < 32; devn++)
+    {
+        d = dev_find_slot(bus, PCI_DEVFN(devn, 0));
+        if (!d)
+            continue;
+
+        classrev = pci_read_config32(d, PCI_CLASS_REVISION);
+        classcode = (u8)(classrev >> 24);
+        vendor = pci_read_config16(d, PCI_VENDOR_ID);
+
+        /* Only display class from S3 vendor */
+        if (classcode == 0x03 && vendor == 0x5333)
+            disable_agp_command(d);
+    }
+  }
+}
+
+
+static void fixup_secondary_bus_irq_lines(u8 sec_bus)
+{
+ if (FIXUP_PCI_IRQ_LINES)
+ {
+    static const u8 rt_irqs[4] = { RT0_IRQ, RT1_IRQ, RT2_IRQ, RT3_IRQ };
+    int devn;
+    int fn;
+    struct device *d;
+    u8 pin;
+    u8 swz;
+    u8 irq;
+
+    for (devn = 0; devn < 32; devn++)
+     {
+        for (fn = 0; fn < 8; fn++)
+          {
+            d = dev_find_slot(sec_bus, PCI_DEVFN(devn, fn));
+            if (!d)
+                continue;
+
+            pin = pci_read_config8(d, PCI_INTERRUPT_PIN); /* 1..4, or 0 if none */
+            if (!pin)
+                continue;
+
+            /* (pin-1 + device) % 4 => RT0..RT3 */
+            swz = (u8)(((pin - 1) + devn) & 3);
+            irq = rt_irqs[swz];
+
+            pci_write_config8(d, PCI_INTERRUPT_LINE, irq);
+        }
+    }
+  }
+}
+
+static struct device *find_display_on_bus(u8 bus)
+{
+    int devn;
+    int fn;
+    struct device *d;
+    u32 classrev;
+    u16 classsub;
+
+    for (devn = 0; devn < 32; devn++)
+    {
+        for (fn = 0; fn < 8; fn++)
+        {
+            d = dev_find_slot(bus, PCI_DEVFN(devn, fn));
+            if (!d)
+                continue;
+
+            classrev = pci_read_config32(d, PCI_CLASS_REVISION);
+            classsub = (u16)((classrev >> 16) & 0xFFFF); /* class<<8 | subclass */
+
+            /* 0x03 = Display controller; 0x0300 = VGA compatible */
+            if ((classsub & 0xFF00) == 0x0300)
+                return d;
+        }
+    }
+    return NULL;
+}
+
+static void stamp_vga_irq_hint(void)
+{
+    /* Endpoint VGA */
+    struct device *vga = find_display_on_bus(0x02);
+    if (vga) pci_write_config8(vga, PCI_INTERRUPT_LINE, RT0_IRQ);
+
+    /* Upstream bridges */
+    struct device *peri = dev_find_slot(0x01, PCI_DEVFN(0x00, 0));
+    if (peri) pci_write_config8(peri, PCI_INTERRUPT_LINE, RT0_IRQ);
+
+    struct device *root = dev_find_slot(0x00, PCI_DEVFN(0x01, 0));
+    if (root) pci_write_config8(root, PCI_INTERRUPT_LINE, RT0_IRQ);
+}
+
+/*
+   ELCR: 0x4D0 -> IRQ0..7, 0x4D1 -> IRQ8..15; bit=1 => level.
+   IRQ0  System timer                EDGE
+   IRQ1  Keyboard                    EDGE
+   IRQ2  PIC                         EDGE
+   IRQ3  COM2                        EDGE
+   IRQ4  COM1                        EDGE
+   IRQ5  PCI VGA/STERING/BRIDGES     LEVEL
+   IRQ6  (X)                         EDGE
+   IRQ7  ISA SND                     EDGE
+   IRQ8  RTC                         EDGE
+   IRQ9  PCI ETH/STEERING            LEVEL
+   IRQ10 PCI USB/STEERING            LEVEL
+   IRQ11 PCI IDE/STEERING            LEVEL
+   IRQ12 PS/2 MOUSE                  EDGE
+   IRQ13 FPU                         EDGE
+   IRQ14 PCI USB/STEERING            LEVEL
+   IRQ15 (X)                         EDGE
+ */
+static void program_elcr_for_pci_isa_irqs(void)
+{
+    uint8_t elcr0 = inb(0x4D0);
+    uint8_t elcr1 = inb(0x4D1);
+
+    /* Set all IRQs to edge trigger */
+    elcr0 &= 0x00;
+    elcr1 &= 0x00;
+
+    /* ELCR0: IRQ5 level, others edge */
+    elcr0 |= (1u<<5);          // IRQ5 = level  (PCI VGA/STEERING/BRIDGES)
+
+
+    /* ELCR1: IRQ9/10/11/14 level, others edge */
+    elcr1 |= (1u<<1)           // IRQ9  level (PCI ETH/STEERING)
+          |  (1u<<2)           // IRQ10 level (PCI USB/STEERING)
+          |  (1u<<3)           // IRQ11 level (PCI IDE/STEERING)
+          |  (1u<<6);          // IRQ14 level (PCI USB/STEERING)
+
+    outb(elcr0, 0x4D0);
+    outb(elcr1, 0x4D1);
+}
+
+/* Enable legacy VGA forwarding on both bridges: VGA Enable + VGA 16-bit decode */
+static void enable_legacy_vga_forwarding(void)
+{
+    /* Bridge control bits */
+    const uint16_t VGA_ENABLE_BIT       = (1u << 3);
+    const uint16_t VGA_16BIT_DECODE_BIT = (1u << 4);
+    const uint16_t VGA_MASK = VGA_ENABLE_BIT | VGA_16BIT_DECODE_BIT;
+
+    /* Root bridge 00:01.0 */
+    struct device *br_root = dev_find_slot(0x00, PCI_DEVFN(0x01, 0));
+    if (br_root)
+    {
+        uint16_t bc = pci_read_config16(br_root, PCI_BRIDGE_CONTROL);
+        bc |= VGA_MASK;
+        pci_write_config16(br_root, PCI_BRIDGE_CONTROL, bc);
+    }
+
+    /* Pericom bridge 01:00.0 */
+    struct device *br_peri = dev_find_slot(0x01, PCI_DEVFN(0x00, 0));
+    if (br_peri)
+    {
+        uint16_t bc = pci_read_config16(br_peri, PCI_BRIDGE_CONTROL);
+        bc |= VGA_MASK;
+        pci_write_config16(br_peri, PCI_BRIDGE_CONTROL, bc);
+    }
+}
+
+
+/* Ensure VGA endpoint and both bridges are fully enabled */
+static void tune_vga_endpoint_and_bridges(void)
+{
+    struct device *vga  = find_display_on_bus(0x02);
+    struct device *br0  = dev_find_slot(0x00, PCI_DEVFN(0x01, 0));
+    struct device *br1  = dev_find_slot(0x01, PCI_DEVFN(0x00, 0));
+
+    if (vga)
+    {
+        u16 cmd = pci_read_config16(vga, PCI_COMMAND);
+        /* IO+MEM+BusMaster */
+        cmd |= PCI_COMMAND_IO | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER;
+        /* Clear Interrupt Disable */
+        cmd &= ~0x0400;
+        pci_write_config16(vga, PCI_COMMAND, cmd);
+
+        /* Latency timer for endpoint */
+        pci_write_config8(vga, PCI_LATENCY_TIMER, 0x40);
+
+        /* Soften error signaling */
+        cmd = pci_read_config16(vga, PCI_COMMAND);
+        /* bit6=Parity Error Response, bit8=SERR# Enable */
+        cmd &= ~((1u << 6) | (1u << 8));
+        pci_write_config16(vga, PCI_COMMAND, cmd);
+
+        /* Arbitration hints Min_Gnt, Max_Lat */
+        pci_write_config8(vga, 0x3E, 0x08);
+        pci_write_config8(vga, 0x3F, 0xF8);
+
+
+       if(DISABLE_VGA_PALETTE_SNOOPING)
+        {
+         cmd = pci_read_config16(vga, PCI_COMMAND);
+         cmd &= ~(1u << 5);
+         pci_write_config16(vga, PCI_COMMAND, cmd);
+        }
+       else
+        {
+         cmd = pci_read_config16(vga, PCI_COMMAND);
+         cmd |= (1u << 5);
+         pci_write_config16(vga, PCI_COMMAND, cmd);
+        }
+    }
+
+    if (br0) pci_write_config8(br0, PCI_LATENCY_TIMER, 0x40);
+    if (br1) pci_write_config8(br1, PCI_LATENCY_TIMER, 0x40);
+}
+
+
+static void enable_isa_forwarding(void)
+{
+    const uint16_t ISA_ENABLE_BIT = (1u << 2);
+    struct device *br0 = dev_find_slot(0x00, PCI_DEVFN(0x01, 0));
+    struct device *br1 = dev_find_slot(0x01, PCI_DEVFN(0x00, 0));
+
+    if (br0)
+     {
+      uint16_t bc = pci_read_config16(br0, PCI_BRIDGE_CONTROL);
+      bc |= ISA_ENABLE_BIT;
+      pci_write_config16(br0, PCI_BRIDGE_CONTROL, bc);
+     }
+
+    if (br1)
+     {
+      uint16_t bc = pci_read_config16(br1, PCI_BRIDGE_CONTROL);
+      bc |= ISA_ENABLE_BIT;
+      pci_write_config16(br1, PCI_BRIDGE_CONTROL, bc);
+     }
 }
 
 static void upload_dmp_keyboard_firmware(struct device *dev)
@@ -170,8 +472,10 @@ static void pci_routing_fixup(struct device *dev)
 	/* assign PCI-e bridge (bus#0, dev#1, fn#0) IRQ to RT0. */
 	pci_assign_irqs(0, 1, slot_irqs[0]);
 
-	/* RT0 is enabled. */
 	int_routing |= irq_to_int_routing[RT0_IRQ] << RT0_IRQ_SHIFT;
+	int_routing |= irq_to_int_routing[RT1_IRQ] << RT1_IRQ_SHIFT;
+	int_routing |= irq_to_int_routing[RT2_IRQ] << RT2_IRQ_SHIFT;
+	int_routing |= irq_to_int_routing[RT3_IRQ] << RT3_IRQ_SHIFT;
 
 	/* assign PCI slot IRQs. */
 	for (i = 0; i < slot_num; i++) {
@@ -179,7 +483,10 @@ static void pci_routing_fixup(struct device *dev)
 	}
 
 	/* Read PCI slot IRQs to see if RT1-3 is used, and enables it */
+
 	for (i = 0; i < slot_num; i++) {
+	/* Skip this loop entirely */
+	continue;
 		unsigned int funct;
 		device_t pdev;
 		u8 irq;
@@ -206,6 +513,7 @@ static void pci_routing_fixup(struct device *dev)
 	int_routing |= irq_to_int_routing[MAC_IRQ] << MAC_IRQ_SHIFT;
 	pci_write_config32(dev, SB_REG_PIRQ_ROUTE, int_routing);
 
+
 	/* Setup S/B PCI Extend Interrupt routing table reg(0xb4). */
 	// ext_int_routing |= irq_to_int_routing[CAN_IRQ] << CAN_IRQ_SHIFT;
 	// ext_int_routing |= irq_to_int_routing[HDA_IRQ] << HDA_IRQ_SHIFT;
@@ -220,6 +528,8 @@ static void pci_routing_fixup(struct device *dev)
 	ext_int_routing |= irq_to_int_routing[IDE1_LEGACY_IRQ] << PIDE_IRQ_SHIFT;
 #endif
 	pci_write_config32(dev, SB_REG_EXT_PIRQ_ROUTE, ext_int_routing);
+
+	fixup_secondary_bus_irq_lines(0x02);
 
 	/* Assign in-chip PCI device IRQs. */
 	if (MAC_IRQ) {
@@ -247,6 +557,13 @@ static void pci_routing_fixup(struct device *dev)
 		unsigned char irqs[4] = { USBD_IRQ, 0, 0, 0 };
 		pci_assign_irqs(0, 0xf, irqs);
 	}
+
+    program_elcr_for_pci_isa_irqs();
+    enable_legacy_vga_forwarding();
+    enable_isa_forwarding();
+    tune_vga_endpoint_and_bridges();
+    stamp_vga_irq_hint();
+    kill_agp_on_bus2_if_s3();
 }
 
 static void vortex_sb_init(struct device *dev)
